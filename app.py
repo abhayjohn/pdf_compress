@@ -2,65 +2,86 @@ import streamlit as st
 import fitz
 import gc
 from io import BytesIO
+from PIL import Image
 
-def compress_iteration(input_bytes, quality, dpi):
-    """Single compression attempt with specific quality/dpi."""
+def get_preview(input_bytes, target_mb):
+    doc = fitz.open(stream=input_bytes, filetype="pdf")
+    orig_mb = len(input_bytes) / (1024 * 1024)
+    
+    # Predictive DPI Formula
+    ratio = (target_mb / orig_mb) ** 0.5
+    predicted_dpi = int(72 * ratio * 1.2)
+    predicted_dpi = max(40, min(predicted_dpi, 150))
+    
+    # Generate preview of the first page
+    page = doc[0]
+    zoom = predicted_dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    
+    # Convert to PIL Image for Streamlit display
+    img = Image.open(BytesIO(pix.tobytes("png")))
+    doc.close()
+    return img, predicted_dpi
+
+def run_full_compression(input_bytes, dpi, quality=60):
     doc = fitz.open(stream=input_bytes, filetype="pdf")
     new_doc = fitz.open()
-    for page in doc:
+    
+    progress_bar = st.progress(0)
+    total_pages = len(doc)
+
+    for i, page in enumerate(doc):
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         img_data = pix.tobytes("jpg", jpg_quality=quality)
+        
         new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
-    
+        
+        # Update progress
+        progress_bar.progress((i + 1) / total_pages)
+        pix = None
+        if i % 10 == 0: gc.collect()
+
     out_buf = BytesIO()
     new_doc.save(out_buf, garbage=4, deflate=True)
     new_doc.close()
     doc.close()
     return out_buf.getvalue()
 
-def smart_compress(input_bytes, target_mb):
-    """Iteratively reduces quality until target size is met."""
-    # Settings to try: (Quality, DPI)
-    # Starts at high quality, moves to 'extreme'
-    presets = [
-        (80, 150), (60, 120), (40, 96), (30, 75), (20, 72), (10, 50)
-    ]
-    
-    last_data = input_bytes
-    for q, d in presets:
-        st.write(f"Trying: Quality {q}%, DPI {d}...")
-        compressed_data = compress_iteration(input_bytes, q, d)
-        current_size = len(compressed_data) / (1024 * 1024)
-        
-        last_data = compressed_data
-        if current_size <= target_mb:
-            return compressed_data, current_size
-            
-    return last_data, len(last_data) / (1024 * 1024)
-
-# --- Streamlit UI ---
-st.title("🎯 Target-Size PDF Compressor")
+# --- UI Layout ---
+st.set_page_config(page_title="Smart PDF Squeezer", layout="wide")
+st.title("⚡ Predictive PDF Compressor with Preview")
 
 uploaded_file = st.file_uploader("Upload PDF (Up to 500MB)", type="pdf")
 
 if uploaded_file:
-    orig_bytes = uploaded_file.getvalue()
-    orig_mb = len(orig_bytes) / (1024 * 1024)
-    st.info(f"Original Size: {orig_mb:.2f} MB")
+    file_bytes = uploaded_file.getvalue()
+    orig_mb = len(file_bytes) / (1024 * 1024)
+    
+    col1, col2 = st.columns([1, 1])
 
-    # The Option to change Target Size
-    target_mb = st.number_input("Enter Target Size (MB):", min_value=1, max_value=int(orig_mb), value=20)
+    with col1:
+        st.info(f"📁 **Original Size:** {orig_mb:.2f} MB")
+        target_mb = st.number_input("Target Size (MB):", min_value=1, value=20)
+        
+        if st.button("Generate Preview"):
+            with st.spinner("Calculating quality..."):
+                preview_img, calc_dpi = get_preview(file_bytes, target_mb)
+                st.session_state['preview'] = preview_img
+                st.session_state['dpi'] = calc_dpi
 
-    if st.button("Compress to Target"):
-        with st.spinner("Searching for best compression level..."):
-            final_data, final_size = smart_compress(orig_bytes, target_mb)
-            
-            if final_size <= target_mb:
-                st.success(f"Success! Final Size: {final_size:.2f} MB")
-            else:
-                st.warning(f"Could only reach {final_size:.2f} MB without making it unreadable.")
+    if 'preview' in st.session_state:
+        with col2:
+            st.subheader(f"Preview (at {st.session_state['dpi']} DPI)")
+            st.image(st.session_state['preview'], use_container_width=True)
+            st.caption("If this looks too blurry, increase your Target Size.")
 
-            st.download_button("Download Result", final_data, f"compressed_{target_mb}mb.pdf")
+        if st.button("Looks Good - Compress Full File"):
+            with st.spinner("Squeezing every page..."):
+                final_pdf = run_full_compression(file_bytes, st.session_state['dpi'])
+                final_size = len(final_pdf) / (1024 * 1024)
+                st.success(f"Final Size: {final_size:.2f} MB")
+                st.download_button("Download Compressed PDF", final_pdf, "compressed.pdf")

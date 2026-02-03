@@ -1,37 +1,31 @@
 import streamlit as st
 import fitz
 import gc
+import zipfile
 from io import BytesIO
 from PIL import Image
 
-def get_preview(input_bytes, target_mb):
+def get_predicted_dpi(input_bytes, target_mb):
+    """Predicts DPI based on file size ratio."""
     doc = fitz.open(stream=input_bytes, filetype="pdf")
     orig_mb = len(input_bytes) / (1024 * 1024)
-    
-    # Predictive DPI Formula
     ratio = (target_mb / orig_mb) ** 0.5
     predicted_dpi = int(72 * ratio * 1.2)
-    predicted_dpi = max(40, min(predicted_dpi, 150))
+    predicted_dpi = max(45, min(predicted_dpi, 150))
     
-    # Generate preview of the first page
+    # Get first page for preview
     page = doc[0]
-    zoom = predicted_dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    
-    # Convert to PIL Image for Streamlit display
+    pix = page.get_pixmap(matrix=fitz.Matrix(predicted_dpi/72, predicted_dpi/72))
     img = Image.open(BytesIO(pix.tobytes("png")))
     doc.close()
-    return img, predicted_dpi
+    return predicted_dpi, img
 
-def run_full_compression(input_bytes, dpi, quality=60):
+def compress_single_pdf(input_bytes, dpi, quality=60):
+    """Processes one PDF page by page to save RAM."""
     doc = fitz.open(stream=input_bytes, filetype="pdf")
     new_doc = fitz.open()
     
-    progress_bar = st.progress(0)
-    total_pages = len(doc)
-
-    for i, page in enumerate(doc):
+    for page in doc:
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
@@ -39,49 +33,57 @@ def run_full_compression(input_bytes, dpi, quality=60):
         
         new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
+        pix = None # Release memory
         
-        # Update progress
-        progress_bar.progress((i + 1) / total_pages)
-        pix = None
-        if i % 10 == 0: gc.collect()
-
     out_buf = BytesIO()
     new_doc.save(out_buf, garbage=4, deflate=True)
     new_doc.close()
     doc.close()
+    gc.collect() # Force clean up
     return out_buf.getvalue()
 
-# --- UI Layout ---
-st.set_page_config(page_title="Smart PDF Squeezer", layout="wide")
-st.title("⚡ Predictive PDF Compressor with Preview")
+# --- UI ---
+st.set_page_config(page_title="Bulk PDF Squeezer", layout="wide")
+st.title("📚 Bulk PDF Ultra-Compressor")
 
-uploaded_file = st.file_uploader("Upload PDF (Up to 500MB)", type="pdf")
+uploaded_files = st.file_uploader("Upload PDF files (Max 500MB per file)", type="pdf", accept_multiple_files=True)
 
-if uploaded_file:
-    file_bytes = uploaded_file.getvalue()
-    orig_mb = len(file_bytes) / (1024 * 1024)
+if uploaded_files:
+    target_mb = st.sidebar.number_input("Target Size per file (MB):", min_value=1, value=20)
     
-    col1, col2 = st.columns([1, 1])
+    # 1. Preview Step (Using the first file)
+    if st.sidebar.button("Generate Preview for First File"):
+        first_file = uploaded_files[0].getvalue()
+        dpi, img = get_predicted_dpi(first_file, target_mb)
+        st.session_state['bulk_dpi'] = dpi
+        st.sidebar.image(img, caption=f"Preview at {dpi} DPI", use_container_width=True)
 
-    with col1:
-        st.info(f"📁 **Original Size:** {orig_mb:.2f} MB")
-        target_mb = st.number_input("Target Size (MB):", min_value=1, value=20)
-        
-        if st.button("Generate Preview"):
-            with st.spinner("Calculating quality..."):
-                preview_img, calc_dpi = get_preview(file_bytes, target_mb)
-                st.session_state['preview'] = preview_img
-                st.session_state['dpi'] = calc_dpi
-
-    if 'preview' in st.session_state:
-        with col2:
-            st.subheader(f"Preview (at {st.session_state['dpi']} DPI)")
-            st.image(st.session_state['preview'], use_container_width=True)
-            st.caption("If this looks too blurry, increase your Target Size.")
-
-        if st.button("Looks Good - Compress Full File"):
-            with st.spinner("Squeezing every page..."):
-                final_pdf = run_full_compression(file_bytes, st.session_state['dpi'])
-                final_size = len(final_pdf) / (1024 * 1024)
-                st.success(f"Final Size: {final_size:.2f} MB")
-                st.download_button("Download Compressed PDF", final_pdf, "compressed.pdf")
+    # 2. Bulk Processing
+    if 'bulk_dpi' in st.session_state:
+        if st.button(f"Compress {len(uploaded_files)} Files"):
+            processed_files = []
+            progress_bar = st.progress(0)
+            
+            for idx, uploaded_file in enumerate(uploaded_files):
+                st.write(f"⏳ Processing: {uploaded_file.name}...")
+                file_bytes = uploaded_file.getvalue()
+                
+                compressed_data = compress_single_pdf(file_bytes, st.session_state['bulk_dpi'])
+                processed_files.append((uploaded_file.name, compressed_data))
+                
+                # Update progress
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+            
+            # 3. Create ZIP for download
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                for name, data in processed_files:
+                    zip_file.writestr(f"compressed_{name}", data)
+            
+            st.success("✅ All files processed!")
+            st.download_button(
+                label="📥 Download All as ZIP",
+                data=zip_buffer.getvalue(),
+                file_name="compressed_pdfs.zip",
+                mime="application/zip"
+            )

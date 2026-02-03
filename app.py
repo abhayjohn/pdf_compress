@@ -1,94 +1,66 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
+import gc
 from io import BytesIO
 
-def compress_pdf(input_bytes, quality, dpi):
-    """
-    Core compression logic:
-    - Opens PDF from memory
-    - Iterates through pages and downsamples images
-    - Saves with 'garbage collection' to strip metadata/unused objects
-    """
+def compress_iteration(input_bytes, quality, dpi):
+    """Single compression attempt with specific quality/dpi."""
     doc = fitz.open(stream=input_bytes, filetype="pdf")
     new_doc = fitz.open()
-
     for page in doc:
-        # Scale factor based on DPI (72 is standard PDF resolution)
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
-        
-        # Convert page to image
         pix = page.get_pixmap(matrix=mat)
-        
-        # Compress image into JPEG format
         img_data = pix.tobytes("jpg", jpg_quality=quality)
-        
-        # Create new page in output doc and insert the "shrunk" image
         new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
-
-    output_buffer = BytesIO()
-    # garbage=4: Eliminate duplicate objects and unused resources
-    # deflate=True: Compress the resulting stream
-    new_doc.save(output_buffer, garbage=4, deflate=True)
+    
+    out_buf = BytesIO()
+    new_doc.save(out_buf, garbage=4, deflate=True)
     new_doc.close()
     doc.close()
-    return output_buffer.getvalue()
+    return out_buf.getvalue()
 
-# --- Streamlit UI Setup ---
-st.set_page_config(page_title="PDF Squeezer Pro", page_icon="🗜️")
+def smart_compress(input_bytes, target_mb):
+    """Iteratively reduces quality until target size is met."""
+    # Settings to try: (Quality, DPI)
+    # Starts at high quality, moves to 'extreme'
+    presets = [
+        (80, 150), (60, 120), (40, 96), (30, 75), (20, 72), (10, 50)
+    ]
+    
+    last_data = input_bytes
+    for q, d in presets:
+        st.write(f"Trying: Quality {q}%, DPI {d}...")
+        compressed_data = compress_iteration(input_bytes, q, d)
+        current_size = len(compressed_data) / (1024 * 1024)
+        
+        last_data = compressed_data
+        if current_size <= target_mb:
+            return compressed_data, current_size
+            
+    return last_data, len(last_data) / (1024 * 1024)
 
-st.title("🗜️ PDF Ultra-Compressor")
-st.markdown("""
-Upload files up to **150MB**. This tool uses image downsampling to reach targets near **20MB**.
-""")
+# --- Streamlit UI ---
+st.title("🎯 Target-Size PDF Compressor")
 
-# File Uploader
-uploaded_file = st.file_uploader("Upload your large PDF", type="pdf")
+uploaded_file = st.file_uploader("Upload PDF (Up to 500MB)", type="pdf")
 
 if uploaded_file:
-    # Calculate original size
-    original_bytes = uploaded_file.getvalue()
-    original_size_mb = len(original_bytes) / (1024 * 1024)
-    
-    st.info(f"📂 **Original Size:** {original_size_mb:.2f} MB")
+    orig_bytes = uploaded_file.getvalue()
+    orig_mb = len(orig_bytes) / (1024 * 1024)
+    st.info(f"Original Size: {orig_mb:.2f} MB")
 
-    # Compression Level Presets
-    mode = st.radio("Compression Intensity:", 
-                    ["Standard (Better Quality)", "Extreme Squeeze (Smallest Size)"])
+    # The Option to change Target Size
+    target_mb = st.number_input("Enter Target Size (MB):", min_value=1, max_value=int(orig_mb), value=20)
 
-    if mode == "Standard (Better Quality)":
-        quality = 60
-        dpi = 120
-    else:
-        # Lower DPI and lower JPEG quality to hit the ~20MB target
-        quality = 30
-        dpi = 75
+    if st.button("Compress to Target"):
+        with st.spinner("Searching for best compression level..."):
+            final_data, final_size = smart_compress(orig_bytes, target_mb)
+            
+            if final_size <= target_mb:
+                st.success(f"Success! Final Size: {final_size:.2f} MB")
+            else:
+                st.warning(f"Could only reach {final_size:.2f} MB without making it unreadable.")
 
-    if st.button("Start Compression"):
-        if original_size_mb > 160:
-            st.warning("This file is quite large. It may take a minute...")
-
-        with st.spinner("Processing..."):
-            try:
-                compressed_pdf_data = compress_pdf(original_bytes, quality, dpi)
-                compressed_size_mb = len(compressed_pdf_data) / (1024 * 1024)
-                
-                # Show results
-                st.success(f"✅ Done! New Size: **{compressed_size_mb:.2f} MB**")
-                
-                # Reduction percentage
-                reduction = (1 - (compressed_size_mb / original_size_mb)) * 100
-                st.write(f"📉 Reduced by: **{reduction:.1f}%**")
-
-                st.download_button(
-                    label="📥 Download Compressed PDF",
-                    data=compressed_pdf_data,
-                    file_name=f"compressed_{uploaded_file.name}",
-                    mime="application/pdf"
-                )
-            except Exception as e:
-                st.error(f"Error processing PDF: {e}")
-
-st.divider()
-st.caption("Note: This method converts pages to images. Text will still be visible but not selectable.")
+            st.download_button("Download Result", final_data, f"compressed_{target_mb}mb.pdf")

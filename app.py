@@ -1,103 +1,144 @@
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 import gc
 import zipfile
 from io import BytesIO
 from PIL import Image
 
-# --- Helper Functions ---
+# --- CORE FUNCTIONS ---
 
-def get_predicted_dpi(input_bytes, target_mb):
-    doc = fitz.open(stream=input_bytes, filetype="pdf")
-    orig_mb = len(input_bytes) / (1024 * 1024)
-    ratio = (target_mb / orig_mb) ** 0.5
-    predicted_dpi = int(72 * ratio * 1.2)
-    predicted_dpi = max(45, min(predicted_dpi, 150))
-    page = doc[0]
-    pix = page.get_pixmap(matrix=fitz.Matrix(predicted_dpi/72, predicted_dpi/72))
-    img = Image.open(BytesIO(pix.tobytes("png")))
-    doc.close()
-    return predicted_dpi, img
+def get_predicted_settings(input_bytes, target_mb):
+    """Calculates optimal DPI based on the target file size."""
+    try:
+        doc = fitz.open(stream=input_bytes, filetype="pdf")
+        orig_mb = len(input_bytes) / (1024 * 1024)
+        
+        # Predictive Formula: (Target/Original)^0.5
+        ratio = (target_mb / orig_mb) ** 0.5
+        predicted_dpi = int(72 * ratio * 1.2) # 20% safety buffer
+        predicted_dpi = max(45, min(predicted_dpi, 150))
+        
+        # Generate a preview of the first page
+        page = doc[0]
+        zoom = predicted_dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.open(BytesIO(pix.tobytes("png")))
+        
+        doc.close()
+        return predicted_dpi, img
+    except Exception as e:
+        st.error(f"Error analyzing PDF: {e}")
+        return 72, None
 
 def compress_single_pdf(input_bytes, dpi, quality=60):
+    """Processes PDF page-by-page to keep RAM usage low."""
     doc = fitz.open(stream=input_bytes, filetype="pdf")
     new_doc = fitz.open()
+    
     for page in doc:
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
+        
+        # Convert page to compressed JPEG bytes
         img_data = pix.tobytes("jpg", jpg_quality=quality)
+        
+        # Insert into new PDF
         new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
-        pix = None
+        
+        pix = None # Clean up page memory immediately
+        
     out_buf = BytesIO()
     new_doc.save(out_buf, garbage=4, deflate=True)
     new_doc.close()
     doc.close()
-    gc.collect()
+    gc.collect() # Force garbage collection for 500MB+ files
     return out_buf.getvalue()
 
-# --- UI Setup ---
-st.set_page_config(page_title="PDF Power Tool", layout="wide")
-tab1, tab2 = st.tabs(["🗜️ Bulk Compressor", "🖼️ Images to PDF"])
+# --- UI LAYOUT ---
 
-# --- TAB 1: COMPRESSOR ---
+st.set_page_config(page_title="PDF Power Tool", layout="wide", page_icon="📄")
+
+st.title("🚀 PDF Power Tool")
+st.markdown("Compress large PDFs or convert images to PDF. Optimized for files up to 500MB.")
+
+tab1, tab2 = st.tabs(["🗜️ Bulk PDF Compressor", "🖼️ Images to PDF"])
+
+# --- TAB 1: PDF COMPRESSION ---
 with tab1:
     st.header("Bulk PDF Compressor")
-    uploaded_pdfs = st.file_uploader("Upload PDFs (Max 500MB/file)", type="pdf", accept_multiple_files=True, key="pdf_uploader")
+    uploaded_pdfs = st.file_uploader("Upload PDFs (Max 500MB/file)", type="pdf", accept_multiple_files=True)
     
     if uploaded_pdfs:
-        target_mb = st.sidebar.number_input("Target Size (MB):", min_value=1, value=20)
-        if st.sidebar.button("Preview Settings"):
-            dpi, img = get_predicted_dpi(uploaded_pdfs[0].getvalue(), target_mb)
-            st.session_state['bulk_dpi'] = dpi
-            st.sidebar.image(img, caption=f"Preview @ {dpi} DPI")
+        target_mb = st.sidebar.number_input("Target Size per file (MB):", min_value=1, value=20)
+        
+        if st.sidebar.button("Calculate & Preview Settings"):
+            # Use the first uploaded file for the preview
+            with st.spinner("Analyzing first file..."):
+                dpi, img = get_predicted_settings(uploaded_pdfs[0].getvalue(), target_mb)
+                st.session_state['bulk_dpi'] = dpi
+                st.sidebar.image(img, caption=f"Preview @ {dpi} DPI", use_container_width=True)
+                st.sidebar.success(f"Calculated DPI: {dpi}")
 
-        if 'bulk_dpi' in st.session_state and st.button("Start Bulk Compression"):
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                for up_file in uploaded_pdfs:
-                    with st.status(f"Compressing {up_file.name}..."):
+        if 'bulk_dpi' in st.session_state:
+            if st.button(f"Compress {len(uploaded_pdfs)} PDF(s)"):
+                zip_buffer = BytesIO()
+                progress_text = st.empty()
+                
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    for i, up_file in enumerate(uploaded_pdfs):
+                        progress_text.text(f"Processing ({i+1}/{len(uploaded_pdfs)}): {up_file.name}")
                         data = compress_single_pdf(up_file.getvalue(), st.session_state['bulk_dpi'])
-                        zf.writestr(f"small_{up_file.name}", data)
-            st.success("All files compressed!")
-            st.download_button("📥 Download ZIP", zip_buffer.getvalue(), "compressed_files.zip")
+                        zf.writestr(f"compressed_{up_file.name}", data)
+                
+                st.success("✅ Compression complete!")
+                st.download_button(
+                    label="📥 Download All (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="compressed_pdfs.zip",
+                    mime="application/zip"
+                )
 
 # --- TAB 2: IMAGES TO PDF ---
 with tab2:
-    st.header("Convert Images to PDF")
-    st.write("Upload multiple images (JPG/PNG) to combine them into a single PDF.")
-    
-    uploaded_imgs = st.file_uploader("Select Images", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    st.header("Images to PDF Converter")
+    uploaded_imgs = st.file_uploader("Select Images (JPG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
     
     if uploaded_imgs:
-        st.write(f"📸 {len(uploaded_imgs)} images selected.")
-        pdf_name = st.text_input("Output PDF Name:", value="converted_images")
+        pdf_name = st.text_input("Filename (without .pdf):", value="my_images")
         
-        if st.button("Convert to PDF"):
-            with st.spinner("Building PDF..."):
+        if st.button("Convert Images to PDF"):
+            with st.spinner("Processing images..."):
                 new_pdf = fitz.open()
                 
                 for img_file in uploaded_imgs:
-                    img_bytes = img_file.getvalue()
-                    # Open image with PIL to get dimensions
-                    img = Image.open(BytesIO(img_bytes))
-                    width, height = img.size
-                    
-                    # Create page with image dimensions
-                    page = new_pdf.new_page(width=width, height=height)
-                    page.insert_image(page.rect, stream=img_bytes)
-                    img.close()
+                    try:
+                        # Convert to RGB to avoid transparency errors
+                        raw_data = img_file.read()
+                        img = Image.open(BytesIO(raw_data))
+                        
+                        if img.mode in ("RGBA", "P"):
+                            img = img.convert("RGB")
+                        
+                        # Sanitize image via intermediate buffer
+                        img_buffer = BytesIO()
+                        img.save(img_buffer, format="JPEG", quality=85)
+                        
+                        # Add to PDF
+                        page = new_pdf.new_page(width=img.size[0], height=img.size[1])
+                        page.insert_image(page.rect, stream=img_buffer.getvalue())
+                        
+                        img.close()
+                    except Exception as e:
+                        st.error(f"Error processing {img_file.name}: {e}")
                 
-                pdf_output = BytesIO()
-                new_pdf.save(pdf_output)
-                new_pdf.close()
-                gc.collect()
-                
-                st.success("✅ PDF Created Successfully!")
-                st.download_button(
-                    label="📥 Download PDF",
-                    data=pdf_output.getvalue(),
-                    file_name=f"{pdf_name}.pdf",
-                    mime="application/pdf"
-                )
+                if len(new_pdf) > 0:
+                    out_pdf = BytesIO()
+                    new_pdf.save(out_pdf, garbage=4, deflate=True)
+                    new_pdf.close()
+                    st.success(f"✅ Created PDF with {len(uploaded_imgs)} pages.")
+                    st.download_button("📥 Download PDF", out_pdf.getvalue(), f"{pdf_name}.pdf")
+                else:
+                    st.error("No valid images found to convert.")

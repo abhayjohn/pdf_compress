@@ -13,7 +13,7 @@ gc.collect()
 def hard_force_compress(uploaded_file, target_mb=19):
     orig_mb = uploaded_file.size / (1024 * 1024)
     # Aggressive quality for large files
-    quality_val = 25 if orig_mb > 100 else 40
+    quality_val = 20 if orig_mb > 150 else 35
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
         for chunk in uploaded_file:
@@ -24,47 +24,49 @@ def hard_force_compress(uploaded_file, target_mb=19):
         doc = fitz.open(f_in_path)
         
         for page in doc:
-            # Get all images on the page
-            image_info = page.get_image_info(hashes=False)
+            # get_images is more stable than get_image_info for xrefs
+            image_list = page.get_images(full=True)
             
-            for img in image_info:
-                xref = img["xref"]
-                if xref == 0: continue # Skip inline images
+            for img_item in image_list:
+                xref = img_item[0] # The first element is always the xref
                 
-                # Extract and Compress
-                base_image = doc.extract_image(xref)
-                if not base_image: continue
+                if xref == 0: continue 
                 
-                pil_img = Image.open(BytesIO(base_image["image"]))
-                
-                # Convert to RGB to ensure no transparency bugs (which cause blank pages)
-                if pil_img.mode != "RGB":
-                    pil_img = pil_img.convert("RGB")
-                
-                # Resizing: If the image is physically huge, scale it down
-                if pil_img.width > 1500:
-                    scale = 1500 / pil_img.width
-                    new_size = (1500, int(pil_img.height * scale))
-                    pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+                try:
+                    base_image = doc.extract_image(xref)
+                    if not base_image: continue
+                    
+                    pil_img = Image.open(BytesIO(base_image["image"]))
+                    
+                    # Force RGB to prevent blank pages from CMYK/Alpha issues
+                    if pil_img.mode != "RGB":
+                        pil_img = pil_img.convert("RGB")
+                    
+                    # Physical downscaling if image is huge
+                    if pil_img.width > 1200:
+                        scale = 1200 / pil_img.width
+                        new_size = (1200, int(pil_img.height * scale))
+                        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
 
-                img_buf = BytesIO()
-                pil_img.save(img_buf, format="JPEG", quality=quality_val, optimize=True)
-                
-                # UPDATE THE IMAGE STREAM
-                doc.update_stream(xref, img_buf.getvalue())
-                
-                # Update object properties to ensure it's recognized as a JPEG
-                doc.set_object_value(xref, "/Subtype", "/Image")
-                doc.set_object_value(xref, "/Filter", "/DCTDecode")
-                doc.set_object_value(xref, "/ColorSpace", "/DeviceRGB")
-                doc.set_object_value(xref, "/BitsPerComponent", "8")
-                
-                pil_img.close()
-                img_buf.close()
+                    img_buf = BytesIO()
+                    pil_img.save(img_buf, format="JPEG", quality=quality_val, optimize=True)
+                    
+                    # Update object stream
+                    doc.update_stream(xref, img_buf.getvalue())
+                    
+                    # Force PDF metadata to recognize the new stream format
+                    doc.set_object_value(xref, "/Subtype", "/Image")
+                    doc.set_object_value(xref, "/Filter", "/DCTDecode")
+                    doc.set_object_value(xref, "/ColorSpace", "/DeviceRGB")
+                    
+                    pil_img.close()
+                    img_buf.close()
+                except:
+                    continue # Skip problematic small icons/masks
 
         # Final save with maximum cleanup
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
-            # garbage=4 and clean=True are non-negotiable for size reduction
+            # clean=True and garbage=4 are the keys to the <20MB goal
             doc.save(f_out.name, garbage=4, deflate=True, clean=True)
             f_out_path = f_out.name
         
@@ -79,21 +81,38 @@ def hard_force_compress(uploaded_file, target_mb=19):
 
     except Exception as e:
         if 'f_in_path' in locals() and os.path.exists(f_in_path): os.remove(f_in_path)
-        st.error(f"Processing Error: {e}")
+        st.error(f"Compression error: {e}")
         return None
 
 # --- UI LAYOUT ---
-st.set_page_config(page_title="PDF Fixer", layout="wide")
-st.title("🎯 Pro PDF Compressor (Anti-Blank Fix)")
+st.set_page_config(page_title="PDF Power Tool", layout="wide")
 
-up_pdf = st.file_uploader("Upload PDF", type="pdf")
+tab1, tab2 = st.tabs(["🗜️ Ultra Compressor (<20MB)", "🖼️ Images to PDF"])
 
-if up_pdf:
-    st.write(f"Original Size: {up_pdf.size / (1024*1024):.2f} MB")
-    if st.button("Compress & Fix"):
-        with st.spinner("Re-encoding images and cleaning PDF structure..."):
-            result = hard_force_compress(up_pdf)
-            if result:
-                new_size = len(result)/(1024*1024)
-                st.success(f"Final Size: {new_size:.2f} MB")
-                st.download_button("Download Fixed PDF", result, "compressed_fixed.pdf")
+with tab1:
+    st.title("🎯 Force 20MB Compressor")
+    up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf", key="pdf_tab")
+    
+    if up_pdf:
+        st.write(f"Original Size: {up_pdf.size / (1024*1024):.2f} MB")
+        if st.button("Compress Now"):
+            with st.spinner("Executing deep compression..."):
+                result = hard_force_compress(up_pdf)
+                if result:
+                    res_mb = len(result)/(1024*1024)
+                    st.success(f"Final Size: {res_mb:.2f} MB")
+                    st.download_button("Download Compressed PDF", result, "final_compressed.pdf")
+
+with tab2:
+    st.title("🖼️ Image to PDF Converter")
+    imgs = st.file_uploader("Upload Images", type=["jpg", "png"], accept_multiple_files=True, key="img_tab")
+    if imgs and st.button("Convert to PDF"):
+        new_pdf = fitz.open()
+        for img_f in imgs:
+            img_obj = Image.open(BytesIO(img_f.read())).convert("RGB")
+            buf = BytesIO()
+            img_obj.save(buf, format="JPEG", quality=70)
+            p = new_pdf.new_page(width=img_obj.size[0], height=img_obj.size[1])
+            p.insert_image(p.rect, stream=buf.getvalue())
+            img_obj.close()
+        st.download_button("Download PDF", new_pdf.tobytes(), "images.pdf")

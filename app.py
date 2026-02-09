@@ -8,7 +8,7 @@ from io import BytesIO
 
 # --- SYSTEM UTILITIES ---
 def purge_system():
-    """Wipes RAM and Streamlit's internal cache to prevent crashes."""
+    """Forces the system to reclaim unused RAM immediately."""
     gc.collect()
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -37,11 +37,11 @@ def process_pdf(input_path, dpi, quality, use_grayscale):
     return out_path
 
 # --- UI SETUP ---
-st.set_page_config(page_title="PDF Convergent Tool", layout="wide")
-st.title("🎯 Convergent 18-20MB Compressor")
-st.markdown("Uses damped feedback to prevent DPI jumping and hit the target precisely.")
+st.set_page_config(page_title="PDF Precision Optimizer", layout="wide")
+st.title("🎯 Precision 20MB Optimizer")
+st.markdown("This app iteratively tunes DPI and quality to get as close to **19.99MB** as possible.")
 
-tab1, tab2 = st.tabs(["🗜️ Polling Compressor", "🖼️ Images to PDF"])
+tab1, tab2 = st.tabs(["🗜️ High-Precision Compressor", "🖼️ Images to PDF"])
 
 with tab1:
     up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf", key="pdf_uploader")
@@ -58,14 +58,16 @@ with tab1:
             del up_pdf 
             purge_system()
 
-            # Iteration Setup
+            # High-Precision Iteration Setup
             current_dpi = 100
-            current_quality = 75
+            current_quality = 80
             attempts = 0
-            max_attempts = 10 
+            max_attempts = 12 # Increased for tighter convergence
             
             status_placeholder = st.empty()
             history = []
+            best_data = None
+            best_size = 0
             
             while attempts < max_attempts:
                 attempts += 1
@@ -75,48 +77,62 @@ with tab1:
                 actual_mb = os.path.getsize(temp_path) / (1024 * 1024)
                 history.append(f"DPI {current_dpi}: {actual_mb:.2f} MB")
                 
-                # Success Condition
-                if 18.0 <= actual_mb <= 20.0:
-                    status_placeholder.success(f"Target Reached! Final Size: {actual_mb:.2f} MB")
+                # Update "Best version so far" if it's under 20MB
+                if actual_mb <= 20.0 and actual_mb > best_size:
                     with open(temp_path, "rb") as f:
-                        final_data = f.read()
-                    os.remove(temp_path)
-                    st.download_button("📥 Download Final PDF", final_data, "final_20mb.pdf")
+                        best_data = f.read()
+                    best_size = actual_mb
+
+                # Stop if we hit the "Goldilocks" spot (19.8MB - 20.0MB)
+                if 19.8 <= actual_mb <= 20.0:
+                    status_placeholder.success(f"Precision Target Hit! Final Size: {actual_mb:.2f} MB")
                     break
                 
-                # Convergent Logic: Damped Square Root Ratio
-                # Instead of jumping fully to the new ratio, we move only 70% of the way (Damping)
-                target_mb = 19.2 # Aim for the middle of the 18-20 range
-                ratio = (target_mb / actual_mb) ** 0.5
+                # Feedback logic: Aiming for 19.9MB
+                target_mb = 19.95
                 
-                # Apply Damping (mix of old DPI and suggested DPI)
-                suggested_dpi = int(current_dpi * ratio)
-                current_dpi = int((current_dpi * 0.3) + (suggested_dpi * 0.7))
-                
-                # Safety Caps
-                current_dpi = max(30, min(current_dpi, 250))
+                # If we are over, use a stronger damping to avoid huge jumps
+                if actual_mb > 20.0:
+                    ratio = (target_mb / actual_mb) ** 0.5
+                    suggested_dpi = int(current_dpi * ratio)
+                    current_dpi = int((current_dpi * 0.4) + (suggested_dpi * 0.6))
+                # If we are under, push the DPI or Quality up
+                else:
+                    ratio = (target_mb / actual_mb) ** 0.5
+                    suggested_dpi = int(current_dpi * ratio)
+                    current_dpi = int((current_dpi * 0.2) + (suggested_dpi * 0.8))
+                    current_quality = min(95, current_quality + 2)
+
+                # Prevent DPI from becoming invalid
+                current_dpi = max(30, min(current_dpi, 300))
 
                 os.remove(temp_path)
                 purge_system() 
 
-            st.write("📈 Compression History:", history)
+            if best_data:
+                st.write(f"📈 Final Optimized Size: {best_size:.2f} MB")
+                st.download_button("📥 Download Final PDF", best_data, "final_20mb.pdf")
+            else:
+                st.error("Could not generate a version under 20MB. Try Grayscale mode.")
             
-            # Final disk cleanup
+            st.write("Compression History:", history)
+            
             if os.path.exists(f_in_path):
                 os.remove(f_in_path)
             purge_system()
 
 with tab2:
+    # Stable Image to PDF Converter
     imgs = st.file_uploader("Select Images", type=["jpg", "png"], accept_multiple_files=True, key="img_uploader")
     if imgs and st.button("Convert & Purge"):
         pdf = fitz.open()
         for img_f in imgs:
             img_obj = Image.open(BytesIO(img_f.read())).convert("RGB")
             buf = BytesIO()
-            img_obj.save(buf, format="JPEG", quality=80)
+            img_obj.save(buf, format="JPEG", quality=85)
             p = pdf.new_page(width=img_obj.size[0], height=img_obj.size[1])
             p.insert_image(p.rect, stream=buf.getvalue())
             img_obj.close()
-        st.download_button("Download PDF", pdf.tobytes(), "images.pdf")
+        st.download_button("Download Image PDF", pdf.tobytes(), "images.pdf")
         del imgs
         purge_system()

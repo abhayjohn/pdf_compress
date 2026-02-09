@@ -3,16 +3,43 @@ import fitz  # PyMuPDF
 import gc
 import os
 import tempfile
+import math
 from PIL import Image
 from io import BytesIO
 
 # --- SYSTEM UTILITIES ---
 def purge_memory():
+    """Clears RAM to prevent Streamlit crashes."""
     gc.collect()
     st.cache_data.clear()
 
-def process_pdf(input_path, dpi, quality, use_grayscale):
-    """Core compression function."""
+def get_size_at_dpi(input_path, dpi, use_grayscale, sample_pages=5):
+    """Probes the file to see how many MBs it generates at a specific DPI."""
+    doc = fitz.open(input_path)
+    total_pages = len(doc)
+    sample_count = min(sample_pages, total_pages)
+    
+    sample_doc = fitz.open()
+    cs = fitz.csGRAY if use_grayscale else fitz.csRGB
+    
+    for i in range(sample_count):
+        page = doc[i]
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72), colorspace=cs)
+        img_data = pix.tobytes("jpg", jpg_quality=75)
+        new_page = sample_doc.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.insert_image(page.rect, stream=img_data)
+    
+    sample_buffer = BytesIO()
+    sample_doc.save(sample_buffer, garbage=3)
+    # Calculate projected total size
+    projected_mb = (sample_buffer.getbuffer().nbytes / sample_count) * total_pages / (1024 * 1024)
+    
+    sample_doc.close()
+    doc.close()
+    return projected_mb
+
+def process_final_pdf(input_path, dpi, use_grayscale):
+    """Final output generation."""
     doc = fitz.open(input_path)
     out_doc = fitz.open()
     cs = fitz.csGRAY if use_grayscale else fitz.csRGB
@@ -20,8 +47,7 @@ def process_pdf(input_path, dpi, quality, use_grayscale):
     for page in doc:
         mat = fitz.Matrix(dpi/72, dpi/72)
         pix = page.get_pixmap(matrix=mat, colorspace=cs)
-        img_data = pix.tobytes("jpg", jpg_quality=quality)
-        
+        img_data = pix.tobytes("jpg", jpg_quality=80) # Higher quality for the final calculated DPI
         new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
         pix = None
@@ -35,75 +61,72 @@ def process_pdf(input_path, dpi, quality, use_grayscale):
     return out_path
 
 # --- UI SETUP ---
-st.set_page_config(page_title="20MB Precision Tool", layout="wide")
-st.title("🎯 Auto-Iterative 20MB Targeter")
+st.set_page_config(page_title="Ratio Optimizer", layout="wide")
+st.title("🎯 Ratio-Based PDF Optimizer")
 
-up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf")
-use_gray = st.checkbox("Force Grayscale (Easier to hit 20MB with high clarity)")
+tab1, tab2 = st.tabs(["🗜️ Compressor", "🖼️ Images to PDF"])
 
-if up_pdf:
-    if st.button("Start High-Precision Compression"):
-        # Save upload to disk
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
-            f_in.write(up_pdf.getbuffer())
-            f_in_path = f_in.name
-        
-        del up_pdf
-        purge_memory()
+with tab1:
+    up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf")
+    use_gray = st.checkbox("Grayscale Mode", value=False)
 
-        # START RECURSIVE OPTIMIZATION
-        # Starting guesses
-        current_dpi = 100
-        current_quality = 70
-        attempts = 0
-        max_attempts = 5
-        final_pdf_data = None
-        
-        status_box = st.empty()
-        
-        while attempts < max_attempts:
-            attempts += 1
-            status_box.info(f"Attempt {attempts}: Testing {current_dpi} DPI...")
+    if up_pdf:
+        if st.button("Compress Using Ratio Calculation"):
+            # 1. Save to disk and clear RAM
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
+                f_in.write(up_pdf.getbuffer())
+                f_in_path = f_in.name
             
-            # Process the file
-            temp_result_path = process_pdf(f_in_path, current_dpi, current_quality, use_gray)
-            file_size_mb = os.path.getsize(temp_result_path) / (1024 * 1024)
-            
-            # Check if we are in the "Perfect Zone" (18.5MB - 19.9MB)
-            if 18.5 <= file_size_mb <= 20.0:
-                status_box.success(f"Perfect hit! Final Size: {file_size_mb:.2f} MB")
-                with open(temp_result_path, "rb") as f:
-                    final_pdf_data = f.read()
-                os.remove(temp_result_path)
-                break
-            
-            # If too large, decrease DPI
-            elif file_size_mb > 20.0:
-                status_box.warning(f"Too large ({file_size_mb:.2f} MB). Reducing DPI...")
-                # Reduce DPI proportional to how much we missed
-                reduction_factor = 20.0 / file_size_mb
-                current_dpi = int(current_dpi * reduction_factor * 0.95)
-                os.remove(temp_result_path)
-            
-            # If much too small (under 18.5MB), increase quality/DPI
-            else:
-                status_box.info(f"Too small ({file_size_mb:.2f} MB). Increasing quality...")
-                increase_factor = 19.5 / file_size_mb
-                current_dpi = int(current_dpi * (increase_factor ** 0.5))
-                current_quality = min(95, int(current_quality * 1.1))
-                # If we've already done 3+ attempts, we'll take the 18MB+ version
-                if file_size_mb > 17.5:
-                    with open(temp_result_path, "rb") as f:
-                        final_pdf_data = f.read()
-                    os.remove(temp_result_path)
-                    break
-                os.remove(temp_result_path)
-            
+            del up_pdf
             purge_memory()
 
-        if final_pdf_data:
-            st.download_button("📥 Download Final Precision PDF", final_pdf_data, "precision_20mb.pdf")
-        
-        if os.path.exists(f_in_path):
-            os.remove(f_in_path)
+            try:
+                # 2. The Probing Pass (at 100 DPI)
+                with st.spinner("Probing file at 100 DPI..."):
+                    current_mb = get_size_at_dpi(f_in_path, 100, use_gray)
+                
+                # 3. Calculate Ratio
+                # Formula: New DPI = 100 * sqrt(19.5 / current_mb)
+                # We use 19.5 to stay safely under the 20MB limit
+                ratio = math.sqrt(19.5 / current_mb)
+                calculated_dpi = int(100 * ratio)
+                
+                # Safety Cap: Don't let DPI go too high or too low
+                calculated_dpi = max(30, min(calculated_dpi, 250))
+                
+                st.info(f"Probed Size: {current_mb:.2f}MB. Calculated optimal DPI: {calculated_dpi}")
+
+                # 4. Final Pass
+                with st.spinner(f"Finalizing at {calculated_dpi} DPI..."):
+                    final_path = process_final_pdf(f_in_path, calculated_dpi, use_gray)
+                    
+                    with open(final_path, "rb") as f:
+                        final_data = f.read()
+                    
+                    actual_size = len(final_data)/(1024*1024)
+                    st.success(f"Final Size: {actual_size:.2f} MB")
+                    st.download_button("📥 Download PDF", final_data, "optimized.pdf")
+                    
+                    os.remove(final_path)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+            finally:
+                if os.path.exists(f_in_path):
+                    os.remove(f_in_path)
+                purge_memory()
+
+with tab2:
+    # Stable Image-to-PDF Converter
+    imgs = st.file_uploader("Select Images", type=["jpg", "png"], accept_multiple_files=True)
+    if imgs and st.button("Convert & Purge"):
+        pdf = fitz.open()
+        for img_f in imgs:
+            img_obj = Image.open(BytesIO(img_f.read())).convert("RGB")
+            buf = BytesIO()
+            img_obj.save(buf, format="JPEG", quality=85)
+            p = pdf.new_page(width=img_obj.size[0], height=img_obj.size[1])
+            p.insert_image(p.rect, stream=buf.getvalue())
+            img_obj.close()
+        st.download_button("Download Image PDF", pdf.tobytes(), "images.pdf")
         purge_memory()

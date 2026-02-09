@@ -3,43 +3,17 @@ import fitz  # PyMuPDF
 import gc
 import os
 import tempfile
-import math
 from PIL import Image
 from io import BytesIO
 
-# --- SYSTEM UTILITIES ---
+# --- 1. MEMORY MANAGEMENT ---
 def purge_memory():
-    """Clears RAM to prevent Streamlit crashes."""
+    """Forces the system to reclaim unused RAM immediately."""
     gc.collect()
     st.cache_data.clear()
 
-def get_size_at_dpi(input_path, dpi, use_grayscale, sample_pages=5):
-    """Probes the file to see how many MBs it generates at a specific DPI."""
-    doc = fitz.open(input_path)
-    total_pages = len(doc)
-    sample_count = min(sample_pages, total_pages)
-    
-    sample_doc = fitz.open()
-    cs = fitz.csGRAY if use_grayscale else fitz.csRGB
-    
-    for i in range(sample_count):
-        page = doc[i]
-        pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72), colorspace=cs)
-        img_data = pix.tobytes("jpg", jpg_quality=75)
-        new_page = sample_doc.new_page(width=page.rect.width, height=page.rect.height)
-        new_page.insert_image(page.rect, stream=img_data)
-    
-    sample_buffer = BytesIO()
-    sample_doc.save(sample_buffer, garbage=3)
-    # Calculate projected total size
-    projected_mb = (sample_buffer.getbuffer().nbytes / sample_count) * total_pages / (1024 * 1024)
-    
-    sample_doc.close()
-    doc.close()
-    return projected_mb
-
-def process_final_pdf(input_path, dpi, use_grayscale):
-    """Final output generation."""
+def process_pdf(input_path, dpi, quality, use_grayscale):
+    """Generates a full PDF and returns the path to the file on disk."""
     doc = fitz.open(input_path)
     out_doc = fitz.open()
     cs = fitz.csGRAY if use_grayscale else fitz.csRGB
@@ -47,7 +21,8 @@ def process_final_pdf(input_path, dpi, use_grayscale):
     for page in doc:
         mat = fitz.Matrix(dpi/72, dpi/72)
         pix = page.get_pixmap(matrix=mat, colorspace=cs)
-        img_data = pix.tobytes("jpg", jpg_quality=80) # Higher quality for the final calculated DPI
+        img_data = pix.tobytes("jpg", jpg_quality=quality)
+        
         new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
         pix = None
@@ -60,64 +35,78 @@ def process_final_pdf(input_path, dpi, use_grayscale):
     doc.close()
     return out_path
 
-# --- UI SETUP ---
-st.set_page_config(page_title="Ratio Optimizer", layout="wide")
-st.title("🎯 Ratio-Based PDF Optimizer")
+# --- 2. UI SETUP ---
+st.set_page_config(page_title="PDF Survivor", layout="wide")
+st.title("🎯 Auto-Iterative 20MB Compressor")
+st.markdown("This app will repeatedly re-try compression until the file is between 18MB and 20MB.")
 
-tab1, tab2 = st.tabs(["🗜️ Compressor", "🖼️ Images to PDF"])
+tab1, tab2 = st.tabs(["🗜️ Auto-Polling Compressor", "🖼️ Images to PDF"])
 
 with tab1:
     up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf")
-    use_gray = st.checkbox("Grayscale Mode", value=False)
+    use_gray = st.checkbox("Use Grayscale (Recommended for 20MB limit)", value=True)
 
     if up_pdf:
-        if st.button("Compress Using Ratio Calculation"):
-            # 1. Save to disk and clear RAM
+        if st.button("Start Iterative Compression"):
+            # Save upload to disk and immediately free RAM
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
                 f_in.write(up_pdf.getbuffer())
                 f_in_path = f_in.name
             
-            del up_pdf
+            del up_pdf # Provision to delete uploaded file from RAM
             purge_memory()
 
-            try:
-                # 2. The Probing Pass (at 100 DPI)
-                with st.spinner("Probing file at 100 DPI..."):
-                    current_mb = get_size_at_dpi(f_in_path, 100, use_gray)
+            # Iteration Variables
+            current_dpi = 100
+            current_quality = 70
+            attempts = 0
+            max_attempts = 5
+            final_pdf_data = None
+            
+            status_placeholder = st.empty()
+            
+            while attempts < max_attempts:
+                attempts += 1
+                status_placeholder.info(f"Attempt {attempts}: Testing {current_dpi} DPI...")
                 
-                # 3. Calculate Ratio
-                # Formula: New DPI = 100 * sqrt(19.5 / current_mb)
-                # We use 19.5 to stay safely under the 20MB limit
-                ratio = math.sqrt(19.5 / current_mb)
-                calculated_dpi = int(100 * ratio)
+                # Perform full compression
+                temp_path = process_pdf(f_in_path, current_dpi, current_quality, use_gray)
+                actual_mb = os.path.getsize(temp_path) / (1024 * 1024)
                 
-                # Safety Cap: Don't let DPI go too high or too low
-                calculated_dpi = max(30, min(calculated_dpi, 250))
+                # Check results
+                if 17.5 <= actual_mb <= 20.0:
+                    status_placeholder.success(f"Target Hit! Final Size: {actual_mb:.2f} MB")
+                    with open(temp_path, "rb") as f:
+                        final_pdf_data = f.read()
+                    os.remove(temp_path)
+                    break
                 
-                st.info(f"Probed Size: {current_mb:.2f}MB. Calculated optimal DPI: {calculated_dpi}")
+                # Adjust for next attempt
+                elif actual_mb > 20.0:
+                    status_placeholder.warning(f"Result too large ({actual_mb:.2f} MB). Reducing DPI...")
+                    # Geometric reduction
+                    current_dpi = int(current_dpi * (20.0 / actual_mb) * 0.9)
+                else:
+                    status_placeholder.info(f"Result too small ({actual_mb:.2f} MB). Increasing DPI/Quality...")
+                    # Increase DPI to fill the 20MB space
+                    current_dpi = int(current_dpi * (19.0 / actual_mb) ** 0.5)
+                    current_quality = min(95, current_quality + 10)
 
-                # 4. Final Pass
-                with st.spinner(f"Finalizing at {calculated_dpi} DPI..."):
-                    final_path = process_final_pdf(f_in_path, calculated_dpi, use_gray)
-                    
-                    with open(final_path, "rb") as f:
-                        final_data = f.read()
-                    
-                    actual_size = len(final_data)/(1024*1024)
-                    st.success(f"Final Size: {actual_size:.2f} MB")
-                    st.download_button("📥 Download PDF", final_data, "optimized.pdf")
-                    
-                    os.remove(final_path)
-
-            except Exception as e:
-                st.error(f"Error: {e}")
-            finally:
-                if os.path.exists(f_in_path):
-                    os.remove(f_in_path)
+                os.remove(temp_path)
                 purge_memory()
+                
+                if attempts == max_attempts:
+                    st.error("Could not reach exactly 20MB after 5 tries, but here is the closest version.")
+
+            if final_pdf_data:
+                st.download_button("📥 Download Final PDF", final_pdf_data, "final_20mb.pdf")
+            
+            if os.path.exists(f_in_path):
+                os.remove(f_in_path)
+            purge_memory()
 
 with tab2:
-    # Stable Image-to-PDF Converter
+    # Stable Image to PDF Converter
     imgs = st.file_uploader("Select Images", type=["jpg", "png"], accept_multiple_files=True)
     if imgs and st.button("Convert & Purge"):
         pdf = fitz.open()

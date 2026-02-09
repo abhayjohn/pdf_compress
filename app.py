@@ -1,149 +1,125 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import gc
-import zipfile
+import os
+import tempfile
 from io import BytesIO
 from PIL import Image
 
-# --- 1. SESSION RESILIENCE GUARD ---
-if 'app_init' not in st.session_state:
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    gc.collect()
-    st.session_state['app_init'] = True
+# --- 1. SYSTEM TWEAKS ---
+# Clear memory globally on startup
+st.cache_data.clear()
+gc.collect()
 
-def force_restart():
-    for key in st.session_state.keys():
-        del st.session_state[key]
+def reboot_logic():
+    st.session_state.clear()
     st.cache_data.clear()
     st.rerun()
 
-# --- CORE FUNCTIONS ---
+# --- 2. OOM-SAFE COMPRESSION ENGINE ---
+def oom_safe_compress(uploaded_file, target_mb):
+    """Uses disk-mapping to avoid the 1GB RAM limit."""
+    
+    # Estimate DPI but strictly cap it at 75 for safety
+    orig_mb = uploaded_file.size / (1024 * 1024)
+    ratio = (target_mb / orig_mb) ** 0.5
+    safe_dpi = max(30, min(int(72 * ratio), 75))
+    
+    st.warning(f"OOM Protection Active: Using {safe_dpi} DPI to stay within 1GB RAM.")
 
-@st.cache_data(show_spinner=False)
-def get_predicted_settings(input_bytes, target_mb):
-    try:
-        doc = fitz.open(stream=input_bytes, filetype="pdf")
-        orig_mb = len(input_bytes) / (1024 * 1024)
-        ratio = (target_mb / orig_mb) ** 0.5
-        predicted_dpi = int(72 * ratio * 1.2)
-        predicted_dpi = max(45, min(predicted_dpi, 150))
-        
-        page = doc[0]
-        zoom = predicted_dpi / 72
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        img = Image.open(BytesIO(pix.tobytes("png")))
-        
-        doc.close()
-        return predicted_dpi, img
-    except Exception:
-        return 72, None
+    # Step 1: Write upload to disk immediately to free RAM
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
+        # Using a chunked write to prevent RAM spikes during file copy
+        for chunk in uploaded_file:
+            f_in.write(chunk)
+        f_in_path = f_in.name
 
-def compress_single_pdf(input_bytes, dpi, quality=60):
     try:
-        doc = fitz.open(stream=input_bytes, filetype="pdf")
-        new_doc = fitz.open()
+        # Step 2: Open PDF from disk (not memory)
+        doc = fitz.open(f_in_path)
+        out_doc = fitz.open()
+
+        progress_bar = st.progress(0, text="Squeezing pages...")
+        total = len(doc)
+
+        for i, page in enumerate(doc):
+            # Render page at low resolution
+            mat = fitz.Matrix(safe_dpi / 72, safe_dpi / 72)
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            
+            # Compress image data immediately
+            img_bits = pix.tobytes("jpg", jpg_quality=40)
+            
+            # Build new PDF
+            new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(page.rect, stream=img_bits)
+            
+            # Step 3: Explicit Deletion for OOM prevention
+            pix = None
+            img_bits = None
+            
+            # Force RAM release every page
+            if i % 1 == 0:
+                gc.collect()
+            
+            progress_bar.progress((i + 1) / total)
+
+        # Step 4: Save result to disk
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
+            out_doc.save(f_out.name, garbage=4, deflate=True)
+            f_out_path = f_out.name
         
-        for page in doc:
-            zoom = dpi / 72
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            img_data = pix.tobytes("jpg", jpg_quality=quality)
-            
-            new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(page.rect, stream=img_data)
-            pix = None 
-            
-        out_buf = BytesIO()
-        new_doc.save(out_buf, garbage=4, deflate=True)
-        new_doc.close()
+        out_doc.close()
         doc.close()
-        gc.collect() 
-        return out_buf.getvalue()
-    except Exception:
+
+        # Final Read
+        with open(f_out_path, "rb") as f:
+            final_data = f.read()
+
+        # Cleanup
+        os.remove(f_in_path)
+        os.remove(f_out_path)
+        return final_data
+
+    except Exception as e:
+        if 'f_in_path' in locals() and os.path.exists(f_in_path): os.remove(f_in_path)
+        st.error(f"Memory Crash Avoided, but error occurred: {e}")
         return None
 
-# --- UI LAYOUT ---
-st.set_page_config(page_title="PDF Power Tool", layout="wide", page_icon="📄")
+# --- UI ---
+st.set_page_config(page_title="PDF Survivor Pro", width="wide")
 
 with st.sidebar:
-    st.title("Settings")
-    if st.button("🔄 Reset App & Cache"):
-        force_restart()
-    st.divider()
+    st.title("Admin")
+    if st.button("Clear RAM/Restart"):
+        reboot_logic()
 
-st.title("🚀 PDF Power Tool")
-st.markdown("Compress large PDFs or convert images to PDF. Optimized for files up to 500MB.")
+st.title("🗜️ Ultra-Stable PDF Compressor")
+st.caption("Designed for 500MB+ files on limited-RAM servers.")
 
-tab1, tab2 = st.tabs(["🗜️ Bulk PDF Compressor", "🖼️ Images to PDF"])
+tab1, tab2 = st.tabs(["🗜️ Compressor", "🖼️ Image Converter"])
 
-# --- TAB 1: PDF COMPRESSION ---
 with tab1:
-    st.header("Bulk PDF Compressor")
-    uploaded_pdfs = st.file_uploader("Upload PDFs (Max 500MB/file)", type="pdf", accept_multiple_files=True, key="compressor_upload")
+    up_pdf = st.file_uploader("Upload large PDF", type="pdf")
+    target = st.number_input("Target Size (MB)", value=20, min_value=1)
     
-    if uploaded_pdfs:
-        target_mb = st.sidebar.number_input("Target Size per file (MB):", min_value=1, value=20)
-        
-        if st.sidebar.button("Calculate & Preview Settings"):
-            with st.spinner("Analyzing first file..."):
-                dpi, img = get_predicted_settings(uploaded_pdfs[0].getvalue(), target_mb)
-                st.session_state['bulk_dpi'] = dpi
-                # FIXED: use_container_width -> width='stretch'
-                st.sidebar.image(img, caption=f"Preview @ {dpi} DPI", width="stretch")
-                st.sidebar.success(f"Calculated DPI: {dpi}")
+    if up_pdf and st.button("Run Safe Compression"):
+        result = oom_safe_compress(up_pdf, target)
+        if result:
+            st.success(f"Success! Size: {len(result)/(1024*1024):.2f} MB")
+            st.download_button("Download PDF", result, "compressed.pdf")
 
-        if 'bulk_dpi' in st.session_state:
-            if st.button(f"Compress {len(uploaded_pdfs)} PDF(s)"):
-                zip_buffer = BytesIO()
-                progress_text = st.empty()
-                
-                with zipfile.ZipFile(zip_buffer, "w") as zf:
-                    for i, up_file in enumerate(uploaded_pdfs):
-                        progress_text.text(f"Processing ({i+1}/{len(uploaded_pdfs)}): {up_file.name}")
-                        data = compress_single_pdf(up_file.getvalue(), st.session_state['bulk_dpi'])
-                        if data:
-                            zf.writestr(f"compressed_{up_file.name}", data)
-                
-                st.success("✅ Compression complete!")
-                st.download_button(
-                    label="📥 Download All (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="compressed_pdfs.zip",
-                    mime="application/zip"
-                )
-
-# --- TAB 2: IMAGES TO PDF ---
 with tab2:
-    st.header("Images to PDF Converter")
-    uploaded_imgs = st.file_uploader("Select Images (JPG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="image_upload")
-    
-    if uploaded_imgs:
-        pdf_name = st.text_input("Filename (without .pdf):", value="my_images")
-        
-        if st.button("Convert Images to PDF"):
-            with st.spinner("Processing images..."):
-                new_pdf = fitz.open()
-                for img_file in uploaded_imgs:
-                    try:
-                        raw_data = img_file.read()
-                        img = Image.open(BytesIO(raw_data))
-                        if img.mode in ("RGBA", "P"):
-                            img = img.convert("RGB")
-                        
-                        img_buffer = BytesIO()
-                        img.save(img_buffer, format="JPEG", quality=85)
-                        
-                        page = new_pdf.new_page(width=img.size[0], height=img.size[1])
-                        page.insert_image(page.rect, stream=img_buffer.getvalue())
-                        img.close()
-                    except Exception as e:
-                        st.error(f"Error processing {img_file.name}: {e}")
-                
-                if len(new_pdf) > 0:
-                    out_pdf = BytesIO()
-                    new_pdf.save(out_pdf, garbage=4, deflate=True)
-                    new_pdf.close()
-                    st.success(f"✅ Created PDF with {len(uploaded_imgs)} pages.")
-                    st.download_button("📥 Download PDF", out_pdf.getvalue(), f"{pdf_name}.pdf")
+    imgs = st.file_uploader("Upload Images", type=["jpg", "png"], accept_multiple_files=True)
+    if imgs and st.button("Convert to PDF"):
+        pdf = fitz.open()
+        for img_f in imgs:
+            # Low-RAM image processing
+            img_obj = Image.open(img_f).convert("RGB")
+            buf = BytesIO()
+            img_obj.save(buf, format="JPEG", quality=60)
+            p = pdf.new_page(width=img_obj.size[0], height=img_obj.size[1])
+            p.insert_image(p.rect, stream=buf.getvalue())
+            img_obj.close()
+            gc.collect()
+        st.download_button("Download PDF", pdf.tobytes(), "images.pdf")

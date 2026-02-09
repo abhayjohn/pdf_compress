@@ -87,7 +87,8 @@ def oom_safe_compress(uploaded_file, target_mb):
         return None
 
 # --- UI ---
-st.set_page_config(page_title="PDF Survivor Pro", width="wide")
+# FIXED: layout="wide" instead of width="wide"
+st.set_page_config(page_title="PDF Survivor Pro", layout="wide")
 
 with st.sidebar:
     st.title("Admin")

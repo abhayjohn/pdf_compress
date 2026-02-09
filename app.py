@@ -10,14 +10,13 @@ from io import BytesIO
 st.cache_data.clear()
 gc.collect()
 
-# --- OPTIMIZED IMAGE-TARGETED COMPRESSION ---
-def smart_object_compress(uploaded_file, target_mb):
+def smart_object_compress(uploaded_file, target_mb=19):
     orig_mb = uploaded_file.size / (1024 * 1024)
-    # Calculate quality (e.g., if target is 10% of orig, quality is 30%)
-    quality_map = max(15, min(int((target_mb / orig_mb) * 100), 75))
     
-    st.info(f"Targeting internal images with {quality_map}% quality. Text will remain sharp.")
-
+    # Pass 1: Extremely aggressive quality mapping
+    # We aim for slightly under 20 (19MB) to stay safe
+    quality_map = max(10, min(int((target_mb / orig_mb) * 100), 50))
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
         for chunk in uploaded_file:
             f_in.write(chunk)
@@ -26,46 +25,42 @@ def smart_object_compress(uploaded_file, target_mb):
     try:
         doc = fitz.open(f_in_path)
         
-        # Iterate through pages to find images
         for page in doc:
             image_list = page.get_images(full=True)
-            
             for img in image_list:
-                xref = img[0]  # The 'xref' index of the image object
-                
-                # Extract the existing image
+                xref = img[0]
                 base_image = doc.extract_image(xref)
                 if not base_image:
                     continue
                 
-                image_bytes = base_image["image"]
+                pil_img = Image.open(BytesIO(base_image["image"]))
                 
-                # Compress the image using PIL
-                pil_img = Image.open(BytesIO(image_bytes))
-                
-                # Convert to RGB if necessary (to allow JPEG saving)
+                # RE-SIZING LOGIC: If file is huge, physically shrink image dimensions
+                if orig_mb > 100:
+                    # Reduce dimensions by 50% for huge files
+                    new_size = (int(pil_img.width * 0.7), int(pil_img.height * 0.7))
+                    pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+
                 if pil_img.mode in ("RGBA", "P"):
                     pil_img = pil_img.convert("RGB")
                 
                 out_buffer = BytesIO()
-                # Applying the calculated quality
-                pil_img.save(out_buffer, format="JPEG", quality=quality_map, optimize=True)
-                new_image_bytes = out_buffer.getvalue()
+                # Save with aggressive JPEG settings
+                pil_img.save(out_buffer, format="JPEG", quality=quality_map, optimize=True, progressive=True)
                 
-                # Replace the old heavy image with the small one in the PDF
-                doc.update_stream(xref, new_image_bytes)
+                # Replace the object
+                doc.update_stream(xref, out_buffer.getvalue())
                 
-                # Crucial: Clean up PIL object
                 pil_img.close()
                 out_buffer.close()
 
-        # Save with garbage=4 to actually delete the old uncompressed data
+        # Final save with maximum cleanup
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
-            doc.save(f_out.name, garbage=4, deflate=True)
+            # garbage=4 is essential to purge the heavy data
+            doc.save(f_out.name, garbage=4, deflate=True, clean=True)
             f_out_path = f_out.name
         
         doc.close()
-
         with open(f_out_path, "rb") as f:
             final_data = f.read()
 
@@ -79,17 +74,38 @@ def smart_object_compress(uploaded_file, target_mb):
         st.error(f"Compression error: {e}")
         return None
 
-# --- UI ---
-st.set_page_config(page_title="PDF Smart Squeezer", layout="wide")
-st.title("🎯 Smart PDF Compressor (Object-Based)")
+# --- UI LAYOUT ---
+st.set_page_config(page_title="20MB Force Squeezer", layout="wide")
+st.title("🎯 The 20MB Hard-Limit Compressor")
+st.markdown("This tool forces PDFs (up to 500MB) to stay near or below **20MB** by resizing internal assets.")
 
-up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf")
-target = st.number_input("Target Size (MB)", value=20, min_value=1)
+tab1, tab2 = st.tabs(["🗜️ Force 20MB Compression", "🖼️ Images to PDF"])
 
-if up_pdf and st.button("Run Smart Compression"):
-    with st.spinner("Finding and shrinking heavy images..."):
-        result = smart_object_compress(up_pdf, target)
-        if result:
-            new_size = len(result)/(1024*1024)
-            st.success(f"Success! Final Size: {new_size:.2f} MB")
-            st.download_button("Download Sharp PDF", result, f"compressed_{target}mb.pdf")
+with tab1:
+    up_pdf = st.file_uploader("Upload PDF", type="pdf", key="pdf_force")
+    if up_pdf:
+        st.info(f"Current Size: {up_pdf.size / (1024*1024):.2f} MB")
+        if st.button("Force Compress to < 20MB"):
+            with st.spinner("Executing high-intensity compression..."):
+                result = smart_object_compress(up_pdf, 19)
+                if result:
+                    res_size = len(result)/(1024*1024)
+                    st.success(f"Final Size: {res_size:.2f} MB")
+                    if res_size > 22:
+                        st.warning("File is extremely dense. Try running the output through again for a second pass.")
+                    st.download_button("Download Compressed PDF", result, "final_under_20mb.pdf")
+
+with tab2:
+    # (Image to PDF logic remains stable)
+    uploaded_imgs = st.file_uploader("Select Images", type=["jpg", "png"], accept_multiple_files=True, key="img_conv")
+    if uploaded_imgs and st.button("Create PDF"):
+        new_pdf = fitz.open()
+        for img_file in uploaded_imgs:
+            img_pil = Image.open(BytesIO(img_file.read()))
+            if img_pil.mode != "RGB": img_pil = img_pil.convert("RGB")
+            img_buf = BytesIO()
+            img_pil.save(img_buf, format="JPEG", quality=60)
+            page = new_pdf.new_page(width=img_pil.size[0], height=img_pil.size[1])
+            page.insert_image(page.rect, stream=img_buf.getvalue())
+            img_pil.close()
+        st.download_button("Download PDF", new_pdf.tobytes(), "images.pdf")

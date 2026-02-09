@@ -6,113 +6,115 @@ import tempfile
 from PIL import Image
 from io import BytesIO
 
-# --- SYSTEM TWEAKS ---
+# --- 1. SYSTEM TWEAKS ---
 st.cache_data.clear()
 gc.collect()
 
-def hard_force_compress(uploaded_file, target_mb=19):
-    orig_mb = uploaded_file.size / (1024 * 1024)
-    # Aggressive quality for large files
-    quality_val = 20 if orig_mb > 150 else 35
+def find_best_dpi(input_path, target_mb):
+    """
+    Quickly tests DPI settings on a small sample of the PDF 
+    to predict the final size without crashing the RAM.
+    """
+    doc = fitz.open(input_path)
+    total_pages = len(doc)
+    # Sample only up to 5 pages to save time/RAM
+    sample_count = min(5, total_pages)
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
-        for chunk in uploaded_file:
-            f_in.write(chunk)
-        f_in_path = f_in.name
-
-    try:
-        doc = fitz.open(f_in_path)
+    best_dpi = 45 # Default fallback
+    # Test common DPI steps from high to low
+    for test_dpi in [150, 120, 96, 72, 60, 45]:
+        sample_doc = fitz.open()
+        for i in range(sample_count):
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(test_dpi/72, test_dpi/72))
+            img_data = pix.tobytes("jpg", jpg_quality=50)
+            new_page = sample_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(page.rect, stream=img_data)
         
-        for page in doc:
-            # get_images is more stable than get_image_info for xrefs
-            image_list = page.get_images(full=True)
+        sample_buffer = BytesIO()
+        sample_doc.save(sample_buffer, garbage=3)
+        # Estimate total size based on sample ratio
+        projected_size = (sample_buffer.getbuffer().nbytes / sample_count) * total_pages
+        projected_mb = projected_size / (1024 * 1024)
+        
+        sample_doc.close()
+        if projected_mb <= target_mb:
+            best_dpi = test_dpi
+            break
             
-            for img_item in image_list:
-                xref = img_item[0] # The first element is always the xref
-                
-                if xref == 0: continue 
-                
-                try:
-                    base_image = doc.extract_image(xref)
-                    if not base_image: continue
-                    
-                    pil_img = Image.open(BytesIO(base_image["image"]))
-                    
-                    # Force RGB to prevent blank pages from CMYK/Alpha issues
-                    if pil_img.mode != "RGB":
-                        pil_img = pil_img.convert("RGB")
-                    
-                    # Physical downscaling if image is huge
-                    if pil_img.width > 1200:
-                        scale = 1200 / pil_img.width
-                        new_size = (1200, int(pil_img.height * scale))
-                        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+    doc.close()
+    return best_dpi
 
-                    img_buf = BytesIO()
-                    pil_img.save(img_buf, format="JPEG", quality=quality_val, optimize=True)
-                    
-                    # Update object stream
-                    doc.update_stream(xref, img_buf.getvalue())
-                    
-                    # Force PDF metadata to recognize the new stream format
-                    doc.set_object_value(xref, "/Subtype", "/Image")
-                    doc.set_object_value(xref, "/Filter", "/DCTDecode")
-                    doc.set_object_value(xref, "/ColorSpace", "/DeviceRGB")
-                    
-                    pil_img.close()
-                    img_buf.close()
-                except:
-                    continue # Skip problematic small icons/masks
-
-        # Final save with maximum cleanup
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
-            # clean=True and garbage=4 are the keys to the <20MB goal
-            doc.save(f_out.name, garbage=4, deflate=True, clean=True)
-            f_out_path = f_out.name
+def process_full_pdf(input_path, dpi, target_mb):
+    """
+    Re-renders the PDF at the chosen DPI. This is the 'safest' way
+    to ensure no black/static images appear.
+    """
+    doc = fitz.open(input_path)
+    out_doc = fitz.open()
+    
+    # Adjust quality based on DPI to squeeze extra space
+    quality = 40 if dpi < 75 else 60
+    
+    progress_bar = st.progress(0, text=f"Applying {dpi} DPI compression...")
+    
+    for i, page in enumerate(doc):
+        # Render page to image (This fixes the 'black image' corruption)
+        mat = fitz.Matrix(dpi/72, dpi/72)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        img_data = pix.tobytes("jpg", jpg_quality=quality)
         
-        doc.close()
-        with open(f_out_path, "rb") as f:
-            final_data = f.read()
+        new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.insert_image(page.rect, stream=img_data)
+        
+        # Immediate memory release
+        pix = None
+        if i % 2 == 0: gc.collect()
+        progress_bar.progress((i + 1) / len(doc))
 
-        os.remove(f_in_path)
-        os.remove(f_out_path)
-        gc.collect()
-        return final_data
-
-    except Exception as e:
-        if 'f_in_path' in locals() and os.path.exists(f_in_path): os.remove(f_in_path)
-        st.error(f"Compression error: {e}")
-        return None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
+        out_doc.save(f_out.name, garbage=4, deflate=True)
+        out_path = f_out.name
+    
+    out_doc.close()
+    doc.close()
+    return out_path
 
 # --- UI LAYOUT ---
-st.set_page_config(page_title="PDF Power Tool", layout="wide")
+st.set_page_config(page_title="PDF Survivor", layout="wide")
+st.title("🎯 Smart Iterative PDF Compressor")
+st.markdown("Finds the best DPI to hit your target size without corrupting images.")
 
-tab1, tab2 = st.tabs(["🗜️ Ultra Compressor (<20MB)", "🖼️ Images to PDF"])
+up_pdf = st.file_uploader("Upload PDF (Up to 500MB)", type="pdf")
 
-with tab1:
-    st.title("🎯 Force 20MB Compressor")
-    up_pdf = st.file_uploader("Upload PDF (Max 500MB)", type="pdf", key="pdf_tab")
+if up_pdf:
+    target_mb = st.number_input("Target Size (MB)", value=20, min_value=1)
     
-    if up_pdf:
-        st.write(f"Original Size: {up_pdf.size / (1024*1024):.2f} MB")
-        if st.button("Compress Now"):
-            with st.spinner("Executing deep compression..."):
-                result = hard_force_compress(up_pdf)
-                if result:
-                    res_mb = len(result)/(1024*1024)
-                    st.success(f"Final Size: {res_mb:.2f} MB")
-                    st.download_button("Download Compressed PDF", result, "final_compressed.pdf")
-
-with tab2:
-    st.title("🖼️ Image to PDF Converter")
-    imgs = st.file_uploader("Upload Images", type=["jpg", "png"], accept_multiple_files=True, key="img_tab")
-    if imgs and st.button("Convert to PDF"):
-        new_pdf = fitz.open()
-        for img_f in imgs:
-            img_obj = Image.open(BytesIO(img_f.read())).convert("RGB")
-            buf = BytesIO()
-            img_obj.save(buf, format="JPEG", quality=70)
-            p = new_pdf.new_page(width=img_obj.size[0], height=img_obj.size[1])
-            p.insert_image(p.rect, stream=buf.getvalue())
-            img_obj.close()
-        st.download_button("Download PDF", new_pdf.tobytes(), "images.pdf")
+    if st.button("Calculate & Compress"):
+        # Step 1: Save to disk to free RAM
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
+            for chunk in up_pdf:
+                f_in.write(chunk)
+            f_in_path = f_in.name
+            
+        try:
+            with st.spinner("Finding optimal DPI settings..."):
+                winning_dpi = find_best_dpi(f_in_path, target_mb)
+                st.success(f"Optimal Resolution Found: {winning_dpi} DPI")
+            
+            with st.spinner("Generating final PDF..."):
+                final_path = process_full_pdf(f_in_path, winning_dpi, target_mb)
+                
+                with open(final_path, "rb") as f:
+                    final_data = f.read()
+                
+                final_mb = len(final_data) / (1024 * 1024)
+                st.info(f"Final Size: {final_mb:.2f} MB")
+                st.download_button("Download Compressed PDF", final_data, "compressed.pdf")
+                
+                # Cleanup
+                os.remove(final_path)
+        except Exception as e:
+            st.error(f"Error: {e}")
+        finally:
+            if os.path.exists(f_in_path): os.remove(f_in_path)

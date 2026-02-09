@@ -12,7 +12,6 @@ from io import BytesIO
 if 'process_lock' not in st.session_state:
     st.session_state.process_lock = threading.Lock()
 
-# Increased limit to 500MB as requested
 MAX_FILE_SIZE_MB = 500 
 
 def purge():
@@ -23,17 +22,19 @@ def fast_compress(input_path, dpi, quality):
     out_doc = fitz.open()
     
     for page in doc:
+        # zoom = dpi / 72. 72 is the internal PDF point system.
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
         
-        # Rendering to pixmap is the most RAM-intensive step
+        # Capture the page as an image
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
         img_data = pix.tobytes("jpg", jpg_quality=quality)
         
+        # Re-insert into a clean PDF page
         new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
         new_page.insert_image(page.rect, stream=img_data)
         
-        pix = None # Immediate RAM release
+        pix = None # Release image from RAM
 
     out_path = tempfile.mktemp(suffix=".pdf")
     out_doc.save(out_path, garbage=4, deflate=True)
@@ -43,24 +44,40 @@ def fast_compress(input_path, dpi, quality):
     return out_path
 
 # --- UI ---
-st.set_page_config(page_title="High-Capacity PDF Compressor", page_icon="⚡")
+st.set_page_config(page_title="Custom PDF Compressor", page_icon="⚙️")
 
-st.title("⚡ High-Capacity PDF Compressor")
-st.info(f"Server configured for files up to {MAX_FILE_SIZE_MB}MB. Processing is queued for stability.")
+st.title("⚙️ Custom PDF Compressor")
+st.info(f"Max Capacity: {MAX_FILE_SIZE_MB}MB per batch. Processing is queued.")
 
-# Sidebar settings
-st.sidebar.header("Compression Settings")
-mode = st.sidebar.select_slider(
-    "Quality Level",
-    options=["Extreme", "Recommended", "High Quality"],
-    value="Recommended"
+# --- DUAL SLIDER SIDEBAR ---
+st.sidebar.header("Compression Tuning")
+
+# Slider 1: Resolution (DPI)
+user_dpi = st.sidebar.slider(
+    "Resolution (DPI)", 
+    min_value=50, 
+    max_value=200, 
+    value=90, 
+    step=10,
+    help="Higher DPI makes text and lines sharper but increases file size significantly."
 )
 
-settings_map = {
-    "Extreme": {"dpi": 60, "quality": 30},
-    "Recommended": {"dpi": 75, "quality": 50},
-    "High Quality": {"dpi": 110, "quality": 75}
-}
+# Slider 2: JPEG Quality
+user_quality = st.sidebar.slider(
+    "Image Quality (%)", 
+    min_value=10, 
+    max_value=100, 
+    value=60, 
+    step=5,
+    help="Lower quality increases 'graininess' in photos but saves a lot of space."
+)
+
+# Technical Status Update
+st.sidebar.divider()
+st.sidebar.write(f"**Target Resolution:** {user_dpi} DPI")
+st.sidebar.write(f"**Compression Level:** {100 - user_quality}% Reduction")
+
+
 
 up_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
 
@@ -68,7 +85,7 @@ if up_files:
     total_size_mb = sum(f.size for f in up_files) / (1024 * 1024)
     
     if total_size_mb > MAX_FILE_SIZE_MB:
-        st.error(f"❌ Total size ({total_size_mb:.1f}MB) exceeds the {MAX_FILE_SIZE_MB}MB limit.")
+        st.error(f"❌ Total size ({total_size_mb:.1f}MB) exceeds limit.")
     else:
         if st.button(f"Compress {len(up_files)} File(s)"):
             with st.session_state.process_lock:
@@ -79,7 +96,7 @@ if up_files:
                 status_box = st.empty()
 
                 for idx, up_file in enumerate(up_files):
-                    status_box.info(f"Processing: **{up_file.name}**")
+                    status_box.info(f"Working on: **{up_file.name}**")
                     
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
                         f_in.write(up_file.getbuffer())
@@ -87,11 +104,8 @@ if up_files:
                     
                     comp_path = None
                     try:
-                        comp_path = fast_compress(
-                            f_in_path, 
-                            settings_map[mode]["dpi"], 
-                            settings_map[mode]["quality"]
-                        )
+                        # Use the custom slider values here
+                        comp_path = fast_compress(f_in_path, user_dpi, user_quality)
                         
                         with open(comp_path, "rb") as f:
                             final_pdf_bytes = f.read()
@@ -104,22 +118,20 @@ if up_files:
                         report_data.append({
                             "File Name": up_file.name,
                             "Original": f"{orig_s:.2f} MB",
-                            "Compressed": f"{new_s:.2f} MB",
-                            "Saved": f"{int((1 - new_s/orig_s)*100)}%"
+                            "New": f"{new_s:.2f} MB",
+                            "Reduction": f"{int((1 - new_s/orig_s)*100)}%"
                         })
 
                     except Exception as e:
-                        st.error(f"Error processing {up_file.name}: {e}")
+                        st.error(f"Error on {up_file.name}: {e}")
                     
                     finally:
-                        if os.path.exists(f_in_path):
-                            os.remove(f_in_path)
-                        if comp_path and os.path.exists(comp_path):
-                            os.remove(comp_path)
+                        if os.path.exists(f_in_path): os.remove(f_in_path)
+                        if comp_path and os.path.exists(comp_path): os.remove(comp_path)
                         purge()
                         progress_bar.progress((idx + 1) / len(up_files))
 
-                status_box.success("✅ Batch Finished!")
+                status_box.success("✅ Process complete!")
                 st.table(pd.DataFrame(report_data))
 
                 if len(processed_results) == 1:
@@ -136,8 +148,8 @@ if up_files:
                             zf.writestr(f"compressed_{name}", data)
                     
                     st.download_button(
-                        label="📥 Download ZIP",
+                        label="📥 Download All (ZIP)",
                         data=zip_buffer.getvalue(),
-                        file_name="batch_compressed.zip",
+                        file_name="compressed_files.zip",
                         mime="application/zip"
                     )

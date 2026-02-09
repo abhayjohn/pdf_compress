@@ -6,7 +6,6 @@ from io import BytesIO
 from PIL import Image
 
 # --- 1. SESSION RESILIENCE GUARD ---
-# This block detects a fresh load or a refresh and clears old cache/state
 if 'app_init' not in st.session_state:
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -14,7 +13,6 @@ if 'app_init' not in st.session_state:
     st.session_state['app_init'] = True
 
 def force_restart():
-    """Manual reset button logic to fix any stuck states."""
     for key in st.session_state.keys():
         del st.session_state[key]
     st.cache_data.clear()
@@ -24,11 +22,9 @@ def force_restart():
 
 @st.cache_data(show_spinner=False)
 def get_predicted_settings(input_bytes, target_mb):
-    """Calculates optimal DPI based on the target file size."""
     try:
         doc = fitz.open(stream=input_bytes, filetype="pdf")
         orig_mb = len(input_bytes) / (1024 * 1024)
-        
         ratio = (target_mb / orig_mb) ** 0.5
         predicted_dpi = int(72 * ratio * 1.2)
         predicted_dpi = max(45, min(predicted_dpi, 150))
@@ -41,11 +37,10 @@ def get_predicted_settings(input_bytes, target_mb):
         
         doc.close()
         return predicted_dpi, img
-    except Exception as e:
+    except Exception:
         return 72, None
 
 def compress_single_pdf(input_bytes, dpi, quality=60):
-    """Processes PDF page-by-page to keep RAM usage low."""
     try:
         doc = fitz.open(stream=input_bytes, filetype="pdf")
         new_doc = fitz.open()
@@ -67,14 +62,11 @@ def compress_single_pdf(input_bytes, dpi, quality=60):
         gc.collect() 
         return out_buf.getvalue()
     except Exception:
-        st.error("Session timed out. Please re-upload your file.")
         return None
 
 # --- UI LAYOUT ---
-
 st.set_page_config(page_title="PDF Power Tool", layout="wide", page_icon="📄")
 
-# Sidebar reset for easy access
 with st.sidebar:
     st.title("Settings")
     if st.button("🔄 Reset App & Cache"):
@@ -98,7 +90,8 @@ with tab1:
             with st.spinner("Analyzing first file..."):
                 dpi, img = get_predicted_settings(uploaded_pdfs[0].getvalue(), target_mb)
                 st.session_state['bulk_dpi'] = dpi
-                st.sidebar.image(img, caption=f"Preview @ {dpi} DPI", use_container_width=True)
+                # FIXED: use_container_width -> width='stretch'
+                st.sidebar.image(img, caption=f"Preview @ {dpi} DPI", width="stretch")
                 st.sidebar.success(f"Calculated DPI: {dpi}")
 
         if 'bulk_dpi' in st.session_state:
@@ -132,12 +125,10 @@ with tab2:
         if st.button("Convert Images to PDF"):
             with st.spinner("Processing images..."):
                 new_pdf = fitz.open()
-                
                 for img_file in uploaded_imgs:
                     try:
                         raw_data = img_file.read()
                         img = Image.open(BytesIO(raw_data))
-                        
                         if img.mode in ("RGBA", "P"):
                             img = img.convert("RGB")
                         
@@ -146,7 +137,6 @@ with tab2:
                         
                         page = new_pdf.new_page(width=img.size[0], height=img.size[1])
                         page.insert_image(page.rect, stream=img_buffer.getvalue())
-                        
                         img.close()
                     except Exception as e:
                         st.error(f"Error processing {img_file.name}: {e}")
@@ -157,5 +147,3 @@ with tab2:
                     new_pdf.close()
                     st.success(f"✅ Created PDF with {len(uploaded_imgs)} pages.")
                     st.download_button("📥 Download PDF", out_pdf.getvalue(), f"{pdf_name}.pdf")
-                else:
-                    st.error("No valid images found to convert.")
